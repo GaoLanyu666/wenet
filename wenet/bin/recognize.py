@@ -31,6 +31,8 @@ from wenet.utils.context_graph import ContextGraph
 from wenet.utils.ctc_utils import get_blank_id
 from wenet.utils.common import TORCH_NPU_AVAILABLE  # noqa just ensure to check torch-npu
 
+from spikingjelly.clock_driven import functional
+
 
 def get_args():
     parser = argparse.ArgumentParser(description='recognize with your model')
@@ -182,10 +184,6 @@ def get_args():
                         type=bool,
                         default=False,
                         help='''Whether to use lora for biasing''')
-    parser.add_argument("--lora_ckpt_path",
-                        default=None,
-                        type=str,
-                        help="lora checkpoint path.")
     args = parser.parse_args()
     print(args)
     return args
@@ -301,6 +299,9 @@ def main():
                     blank_penalty=args.blank_penalty,
                     length_penalty=args.length_penalty,
                     infos=infos)
+
+                functional.reset_net(model)  # snn
+
                 for i, key in enumerate(keys):
                     for mode, hyps in results.items():
                         tokens = hyps[i].tokens

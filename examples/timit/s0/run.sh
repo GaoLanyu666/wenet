@@ -5,9 +5,10 @@
 
 # Use this to control how many gpu you use, It's 1-gpu training if you specify
 # just 1gpu, otherwise it's is multiple gpu training based on DDP in pytorch
-export CUDA_VISIBLE_DEVICES="0"
-stage=0     # start from 0 if you need to start from data preparation
-stop_stage=4
+#export CUDA_VISIBLE_DEVICES="0"
+export CUDA_VISIBLE_DEVICES="2"
+stage=4     # start from 0 if you need to start from data preparation
+stop_stage=5
 
 # You should change the following two parameters for multiple machine training,
 # see https://pytorch.org/docs/stable/elastic/run.html
@@ -16,7 +17,7 @@ num_nodes=1
 job_id=2023
 
 # data
-timit_data=/home/Liangcd/data/timit
+timit_data=/root/data/TIMIT
 # path to save preproecssed data
 # export data=data
 
@@ -38,8 +39,8 @@ train_set=train
 # 5. conf/train_conformer_no_pos.yaml: Conformer without relative positional encoding
 # 6. conf/train_u2++_conformer.yaml: U2++ conformer
 # 7. conf/train_u2++_transformer.yaml: U2++ transformer
-train_config=conf/train_transformer.yaml
-dir=exp/transformer_phn_5k_acc4_bs16
+train_config=conf/train_spikeconformer_relSSALN_T2.yaml
+dir=exp/spikeconformer_relSSALN_T2_phn_5k_acc4_bs16
 checkpoint=
 
 
@@ -137,7 +138,7 @@ if [ ${stage} -le 4 ] && [ ${stop_stage} -ge 4 ]; then
       --model_dir $dir \
       --ddp.dist_backend $dist_backend \
       --num_workers 1 \
-      --pin_memory \
+      --pin_memory
       --deepspeed_config ${deepspeed_config} \
       --deepspeed.save_states ${deepspeed_save_states}
 fi
@@ -174,11 +175,13 @@ if [ ${stage} -le 5 ] && [ ${stop_stage} -ge 5 ]; then
       --blank_penalty 0.0 \
       --ctc_weight $ctc_weight \
       --reverse_weight $reverse_weight \
-      --result_file $test_dir/text \
+      --result_dir $test_dir/text \
+      # --result_file $test_dir/text \
       ${decoding_chunk_size:+--decoding_chunk_size $decoding_chunk_size} \
-      --connect_symbol ▁
+        #    --connect_symbol ▁
     python tools/compute-wer.py --char=1 --v=1 \
-      data/test/text $test_dir/text > $test_dir/wer
+      data/test/text $test_dir/text/${mode}/text > $test_dir/wer
+      #data/test/text $test_dir/text > $test_dir/wer
   } &
   done
   wait

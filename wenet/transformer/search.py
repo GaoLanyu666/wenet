@@ -451,3 +451,125 @@ def attention_rescoring(
                          times=ctc_prefix_results[b].nbest_times[best_index],
                          tokens_confidence=tokens_confidences[best_index]))
     return results
+
+
+def spike_attention_beam_search(
+    model,
+    encoder_out: torch.Tensor,
+    encoder_mask: torch.Tensor,
+    beam_size: int = 10,
+    length_penalty: float = 0.0,
+    infos: Dict[str, List[str]] = None,
+) -> List[DecodeResult]:
+    device = encoder_out.device
+    batch_size = encoder_out.shape[0]
+    # Let's assume B = batch_size and N = beam_size
+    # 1. Encoder
+    maxlen = encoder_out.size(1)
+    encoder_dim = encoder_out.size(2)
+    running_size = batch_size * beam_size
+    if getattr(model, 'special_tokens', None) is not None \
+            and "transcribe" in model.special_tokens:
+        tasks, langs = infos["tasks"], infos["langs"]
+        tasks = [t for t in tasks for _ in range(beam_size)]
+        langs = [l for l in langs for _ in range(beam_size)]
+        hyps = torch.ones([running_size, 0], dtype=torch.long,
+                          device=device)  # (B*N, 0)
+        hyps, _ = add_whisper_tokens(model.special_tokens,
+                                     hyps,
+                                     model.ignore_id,
+                                     tasks=tasks,
+                                     no_timestamp=True,
+                                     langs=langs,
+                                     use_prev=False)
+    else:
+        hyps = torch.ones([running_size, 1], dtype=torch.long,
+                          device=device).fill_(model.sos)  # (B*N, 1)
+    prefix_len = hyps.size(1)
+    scores = torch.tensor([0.0] + [-float('inf')] * (beam_size - 1),
+                          dtype=torch.float)
+    scores = scores.to(device).repeat([batch_size
+                                       ]).unsqueeze(1).to(device)  # (B*N, 1)
+    end_flag = torch.zeros_like(scores, dtype=torch.bool, device=device)
+    cache = {
+        'self_att_cache': {},
+        'cross_att_cache': {},
+    }
+    if model.decoder.use_sdpa:
+        encoder_mask = mask_to_bias(encoder_mask, encoder_out.dtype)
+    if hasattr(model, 'decode_maxlen'):
+        maxlen = model.decode_maxlen
+    # 2. Decoder forward step by step
+    for i in range(prefix_len, maxlen + 1):
+        # Stop if all batch and all beam produce eos
+        if end_flag.sum() == running_size:
+            break
+        # 2.1 Forward decoder step
+        hyps_mask = subsequent_mask(i).unsqueeze(0).repeat(
+            running_size, 1, 1).to(device)  # (B*N, i, i)
+        if model.decoder.use_sdpa:
+            hyps_mask = mask_to_bias(hyps_mask, encoder_out.dtype)
+        # logp: (B*N, vocab)
+        logp = model.decoder.forward_one_step(encoder_out, encoder_mask, hyps,
+                                              hyps_mask, cache)
+        # 2.2 First beam prune: select topk best prob at current time
+        top_k_logp, top_k_index = logp.topk(beam_size)  # (B*N, N)
+        top_k_logp = mask_finished_scores(top_k_logp, end_flag)
+        top_k_index = mask_finished_preds(top_k_index, end_flag, model.eos)
+        # 2.3 Second beam prune: select topk score with history
+        scores = scores + top_k_logp  # (B*N, N), broadcast add
+        scores = scores.view(batch_size, beam_size * beam_size)  # (B, N*N)
+        scores, offset_k_index = scores.topk(k=beam_size)  # (B, N)
+        # Update cache to be consistent with new topk scores / hyps
+        cache_index = (offset_k_index // beam_size).view(-1)  # (B*N)
+        base_cache_index = (torch.arange(batch_size, device=device).view(
+            -1, 1).repeat([1, beam_size]) * beam_size).view(-1)  # (B*N)
+        cache_index = base_cache_index + cache_index
+        cache['self_att_cache'] = {
+            # i_layer: (torch.index_select(value[0], dim=0, index=cache_index),
+            # torch.index_select(value[1], dim=0, index=cache_index))
+            i_layer: (
+                torch.index_select(value[0], dim=1, index=cache_index),  # SNN
+                torch.index_select(value[1], dim=1, index=cache_index))  # SNN
+            for (i_layer, value) in cache['self_att_cache'].items()
+        }
+        # NOTE(Mddct): we don't need select cross att here
+        torch.cuda.empty_cache()
+        scores = scores.view(-1, 1)  # (B*N, 1)
+        # 2.4. Compute base index in top_k_index,
+        # regard top_k_index as (B*N*N),regard offset_k_index as (B*N),
+        # then find offset_k_index in top_k_index
+        base_k_index = torch.arange(batch_size, device=device).view(
+            -1, 1).repeat([1, beam_size])  # (B, N)
+        base_k_index = base_k_index * beam_size * beam_size
+        best_k_index = base_k_index.view(-1) + offset_k_index.view(-1)  # (B*N)
+
+        # 2.5 Update best hyps
+        best_k_pred = torch.index_select(top_k_index.view(-1),
+                                         dim=-1,
+                                         index=best_k_index)  # (B*N)
+        best_hyps_index = best_k_index // beam_size
+        last_best_k_hyps = torch.index_select(
+            hyps, dim=0, index=best_hyps_index)  # (B*N, i)
+        hyps = torch.cat((last_best_k_hyps, best_k_pred.view(-1, 1)),
+                         dim=1)  # (B*N, i+1)
+
+        # 2.6 Update end flag
+        end_flag = torch.eq(hyps[:, -1], model.eos).view(-1, 1)
+
+    # 3. Select best of best
+    scores = scores.view(batch_size, beam_size)
+    lengths = hyps.ne(model.eos).sum(dim=1).view(batch_size, beam_size).float()
+    scores = scores / lengths.pow(length_penalty)
+    best_scores, best_index = scores.max(dim=-1)
+    best_hyps_index = best_index + torch.arange(
+        batch_size, dtype=torch.long, device=device) * beam_size
+    best_hyps = torch.index_select(hyps, dim=0, index=best_hyps_index)
+    best_hyps = best_hyps[:, prefix_len:]
+
+    results = []
+    for i in range(batch_size):
+        hyp = best_hyps[i]
+        hyp = hyp[hyp != model.eos]
+        results.append(DecodeResult(hyp.tolist()))
+    return results

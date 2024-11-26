@@ -27,6 +27,8 @@ from wenet.utils.train_utils import (wenet_join, batch_forward, batch_backward,
                                      update_parameter_and_lr, log_per_step,
                                      save_model)
 
+from spikingjelly.clock_driven import functional
+
 
 class Executor:
 
@@ -88,6 +90,9 @@ class Executor:
                 info_dict = update_parameter_and_lr(model, optimizer,
                                                     scheduler, scaler,
                                                     info_dict)
+
+                functional.reset_net(model)  # snn
+
                 # write training: tensorboard && log
                 log_per_step(writer, info_dict, timer=self.train_step_timer)
                 save_interval = info_dict.get('save_interval', sys.maxsize)
@@ -140,11 +145,14 @@ class Executor:
 
                 info_dict = batch_forward(model, batch_dict, None, info_dict,
                                           self.device)
+
+                functional.reset_net(model)  # snn
+
                 _dict = info_dict["loss_dict"]
 
                 num_seen_utts += num_utts
-                total_acc.append(_dict['th_accuracy'].item(
-                ) if _dict.get('th_accuracy', None) is not None else 0.0)
+                total_acc.append(_dict['th_accuracy'].item() if _dict.
+                                 get('th_accuracy', None) is not None else 0.0)
                 for loss_name, loss_value in _dict.items():
                     if loss_value is not None and "loss" in loss_name \
                             and torch.isfinite(loss_value):

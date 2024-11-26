@@ -6,7 +6,9 @@ from torch.nn import BatchNorm1d, LayerNorm
 from wenet.paraformer.embedding import ParaformerPositinoalEncoding
 from wenet.transformer.norm import RMSNorm
 from wenet.transformer.positionwise_feed_forward import (
-    GatedVariantsMLP, MoEFFNLayer, PositionwiseFeedForward)
+    GatedVariantsMLP, MoEFFNLayer, PositionwiseFeedForward,
+    SpikePositionwiseFeedForward, SpikeLengthPositionwiseFeedForward,
+    SpikeAudioLengthPositionwiseFeedForward, MS_MLP)
 
 from wenet.transformer.swish import Swish
 from wenet.transformer.subsampling import (
@@ -14,6 +16,11 @@ from wenet.transformer.subsampling import (
     EmbedinigNoSubsampling,
     Conv1dSubsampling2,
     Conv2dSubsampling4,
+    Conv2dSubsampling4_Spike,
+    Conv2dSubsampling4_Spike_OriginMask,
+    Conv2dSubsampling4_Spike_T_OriginMask,
+    Conv2dSubsampling4_Spike_Length_OriginMask,
+    Conv2dSubsampling4_Spike_Audio_Length_OriginMask,
     Conv2dSubsampling6,
     Conv2dSubsampling8,
     StackNFramesSubsampling,
@@ -26,11 +33,11 @@ from wenet.transformer.embedding import (PositionalEncoding,
                                          WhisperPositionalEncoding,
                                          LearnablePositionalEncoding,
                                          NoPositionalEncoding)
-from wenet.transformer.attention import (MultiHeadedAttention,
-                                         MultiHeadedCrossAttention,
-                                         RelPositionMultiHeadedAttention,
-                                         RopeMultiHeadedAttention,
-                                         ShawRelPositionMultiHeadedAttention)
+from wenet.transformer.attention import (
+    MultiHeadedAttention, SSA, SSA_BN, SSA_ConvBN, SSA_LN, SSCA_LN,
+    RelPositionSSA_BN, RelPositionSSA_ConvBN, RelPositionSSA_LN,
+    MultiHeadedCrossAttention, SSCA, RelPositionMultiHeadedAttention,
+    RopeMultiHeadedAttention, ShawRelPositionMultiHeadedAttention)
 from wenet.efficient_conformer.attention import (
     GroupedRelPositionMultiHeadedAttention)
 
@@ -55,6 +62,13 @@ WENET_SUBSAMPLE_CLASSES = {
     "conv1d2": Conv1dSubsampling2,
     "conv2d2": Conv2dSubsampling2,
     "conv2d": Conv2dSubsampling4,
+    "conv2d_spike": Conv2dSubsampling4_Spike,
+    "conv2d_spike_originmask": Conv2dSubsampling4_Spike_OriginMask,
+    "conv2d_spike_t_originmask": Conv2dSubsampling4_Spike_T_OriginMask,
+    "conv2d_spike_length_originmask":
+    Conv2dSubsampling4_Spike_Length_OriginMask,
+    "conv2d_spike_audio_length_originmask":
+    Conv2dSubsampling4_Spike_Audio_Length_OriginMask,
     "dwconv2d4": DepthwiseConv2dSubsampling4,
     "conv2d6": Conv2dSubsampling6,
     "conv2d8": Conv2dSubsampling8,
@@ -75,15 +89,30 @@ WENET_EMB_CLASSES = {
 
 WENET_ATTENTION_CLASSES = {
     "selfattn": MultiHeadedAttention,
+    "spike_selfattn": SSA,
+    "spike_bn_selfattn": SSA_BN,
+    "spike_bn_rel_selfattn": RelPositionSSA_BN,
+    "spike_ln_selfattn": SSA_LN,
+    "spike_ln_rel_selfattn": RelPositionSSA_LN,
+    "spike_convbn_selfattn": SSA_ConvBN,
+    "spike_convbn_rel_selfattn": RelPositionSSA_ConvBN,
     "rel_selfattn": RelPositionMultiHeadedAttention,
     "grouped_rel_selfattn": GroupedRelPositionMultiHeadedAttention,
     "crossattn": MultiHeadedCrossAttention,
+    "spike_crossattn": SSCA,
+    "spike_crossattn_ln": SSCA_LN,
     'shaw_rel_selfattn': ShawRelPositionMultiHeadedAttention,
     'rope_abs_selfattn': RopeMultiHeadedAttention,
 }
 
 WENET_MLP_CLASSES = {
     'position_wise_feed_forward': PositionwiseFeedForward,
+    'spikeconformer_position_wise_feed_forward': SpikePositionwiseFeedForward,
+    'spikeconformer_length_position_wise_feed_forward':
+    SpikeLengthPositionwiseFeedForward,
+    'spikeconformer_audio_length_position_wise_feed_forward':
+    SpikeAudioLengthPositionwiseFeedForward,
+    'spike_position_wise_feed_forward': MS_MLP,
     'moe': MoEFFNLayer,
     'gated': GatedVariantsMLP
 }

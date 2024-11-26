@@ -16,7 +16,7 @@ fi
 # if you don't want to utilize all available GPU resources.
 export CUDA_VISIBLE_DEVICES="${gpu_list}"
 echo "CUDA_VISIBLE_DEVICES is ${CUDA_VISIBLE_DEVICES}"
-stage=0 # start from 0 if you need to start from data preparation
+stage=4 # start from 0 if you need to start from data preparation
 stop_stage=5
 
 # You should change the following two parameters for multiple machine training,
@@ -28,18 +28,18 @@ job_id=2023
 # data
 data_url=www.openslr.org/resources/12
 # use your own data path
-datadir=/export/data/en-asr-data/OpenSLR
+datadir=/public/home/wangmiao/dataset/en-asr-data/OpenSLR
 # wav data dir
 wave_data=data
 data_type=raw
 # Optional train_config
 # 1. conf/train_transformer_large.yaml: Standard transformer
-train_config=conf/train_conformer.yaml
-checkpoint=
+train_config=conf/train_spikeconformer_relSSALN.yaml
+checkpoint=/public/home/wangmiao/gly/code/wenet/examples/librispeech/s0/exp/spikeconformer_relSSALN_grad1_sp_spec_aug/epoch_9.pt
 num_workers=1
 do_delta=false
 
-dir=exp/sp_spec_aug
+dir=exp/spikeconformer_relSSALN_grad1_sp_spec_aug
 tensorboard_dir=tensorboard
 
 # use average_checkpoint will get better result

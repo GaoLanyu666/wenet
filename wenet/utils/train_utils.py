@@ -17,7 +17,7 @@ from contextlib import nullcontext
 import copy
 from typing import List, Optional
 
-import deepspeed
+# import deepspeed
 import json
 import logging
 import os
@@ -33,12 +33,13 @@ from torch.nn.utils import clip_grad_norm_
 from torch.distributed.fsdp import (FullyShardedDataParallel as FSDP,
                                     CPUOffload, MixedPrecision,
                                     sharded_grad_scaler, ShardingStrategy)
-from deepspeed.runtime.zero.stage_1_and_2 import (
-    estimate_zero2_model_states_mem_needs_all_live)
-from deepspeed.runtime.zero.stage3 import (
-    estimate_zero3_model_states_mem_needs_all_live)
-from deepspeed.utils.zero_to_fp32 import (
-    convert_zero_checkpoint_to_fp32_state_dict)
+# from deepspeed.runtime.zero.stage_1_and_2 import (
+#     estimate_zero2_model_states_mem_needs_all_live)
+# from deepspeed.runtime.zero.stage3 import (
+#     estimate_zero3_model_states_mem_needs_all_live)
+# from deepspeed.utils.zero_to_fp32 import (
+#    convert_zero_checkpoint_to_fp32_state_dict)
+from wenet.dataset.dataset import Dataset
 from wenet.utils.checkpoint import save_checkpoint
 from wenet.utils.common import (StepTimer, get_nested_attribute, lrs_to_str,
                                 tensor_to_scalar)
@@ -48,7 +49,6 @@ from wenet.utils.fsdp_utils import (check_gradient_checkpoint, fsdp_save_model,
 from wenet.utils.scheduler import WarmupLR, NoamHoldAnnealing
 from wenet.utils.ctc_utils import get_blank_id
 from wenet.utils.common import TORCH_NPU_AVAILABLE
-from wenet.utils.init_dataset import init_dataset
 
 
 def add_model_args(parser):
@@ -86,10 +86,11 @@ def add_trace_args(parser):
                         action='store_true',
                         default=False,
                         help='if use jit to trace model while training stage')
-    parser.add_argument('--print_model',
-                        action='store_true',
-                        default=False,
-                        help='print model')
+    parser.add_argument(
+        '--print_model',
+        action='store_true',
+        default=True,  # default=False,
+        help='print model')
     return parser
 
 
@@ -116,14 +117,6 @@ def add_dataset_args(parser):
 
 
 def add_lora_args(parser):
-    '''Configure parameters for LoRA fine-tuning. Set use_lora and
-       only_optimize_lora to true to enable LoRA functionality.
-       LoRA will be injected to model through (lora_modules, lora_attn_attr,
-       lora_list).
-       LoRA weights will be merged after calling model.eval()
-       (or model.train(mode=False)).
-       LoRA weights need to be loaded after fine-tuning with DeepSpeed.
-    '''
     parser.add_argument("--use_lora",
                         default=False,
                         type=bool,
@@ -133,22 +126,9 @@ def add_lora_args(parser):
                         type=bool,
                         help="freeze all other paramters and only optimize \
                         LoRA-related prameters.")
-    parser.add_argument(
-        '--lora_modules',
-        default="encoder.encoders",
-        type=lambda s: [str(mod) for mod in s.split(",") if s != ""],
-        help='modules names needs inject lora',
-    )
-    parser.add_argument(
-        "--lora_attn_attr",
-        default="self_attn,src_attn",
-        type=lambda s: [str(mod) for mod in s.split(",") if s != ""],
-        help="lora_attn_attr.")
-    parser.add_argument(
-        "--lora_list",
-        default="linear_out,linear_q,linear_k,linear_v",
-        type=lambda s: [str(mod) for mod in s.split(",") if s != ""],
-        help="lora module list.")
+    parser.add_argument("--lora_list",
+                        default=['o', 'q', 'k', 'v'],
+                        help="lora module list.")
     parser.add_argument("--lora_rank",
                         default=8,
                         type=int,
@@ -161,18 +141,6 @@ def add_lora_args(parser):
                         default=0,
                         type=float,
                         help="lora dropout param.")
-    parser.add_argument("--lora_ckpt_path",
-                        default=None,
-                        type=str,
-                        help="lora checkpoint path.")
-    parser.add_argument("--lora_reinit",
-                        default=False,
-                        type=bool,
-                        help="whether use the lora init, default is zero init.")
-    parser.add_argument('--lora_init_yaml',
-                        default="wenet/finetune/lora/config.yaml",
-                        type=str,
-                        help='Path to the configuration YAML file')
     return parser
 
 
@@ -209,7 +177,7 @@ def add_deepspeed_args(parser):
                         choices=['model_only', 'model+optimizer'],
                         help='save model/optimizer states')
     # DeepSpeed automaticly add '--deepspeed' and '--deepspeed_config' to parser
-    parser = deepspeed.add_config_arguments(parser)
+    # parser = deepspeed.add_config_arguments(parser)
     return parser
 
 
@@ -316,31 +284,25 @@ def check_modify_and_save_config(args, configs, symbol_table):
         assert ds_configs["steps_per_print"] == configs['log_interval']
 
     if args.use_lora:
-        configs['lora_conf'] = {}
-        configs['lora_conf']['lora_modules'] = args.lora_modules
-        configs['lora_conf']['lora_attn_attr'] = args.lora_attn_attr
-        configs['lora_conf']['lora_list'] = args.lora_list
-        configs['lora_conf']['lora_rank'] = args.lora_rank
-        configs['lora_conf']['lora_alpha'] = args.lora_alpha
-        configs['lora_conf']['lora_dropout'] = args.lora_dropout
+        configs['encoder_conf']['lora_list'] = args.lora_list
+        configs['encoder_conf']['lora_rank'] = args.lora_rank
+        configs['encoder_conf']['lora_alpha'] = args.lora_alpha
+        configs['encoder_conf']['lora_dropout'] = args.lora_dropout
 
-    if configs["model"] == 'asr_model':
-        if 'input_dim' not in configs:
-            if 'fbank_conf' in configs['dataset_conf']:
-                input_dim = configs['dataset_conf']['fbank_conf'][
-                    'num_mel_bins']
-            elif 'log_mel_spectrogram_conf' in configs['dataset_conf']:
-                input_dim = configs['dataset_conf'][
-                    'log_mel_spectrogram_conf']['num_mel_bins']
-            else:
-                input_dim = configs['dataset_conf']['mfcc_conf'][
-                    'num_mel_bins']
+    if 'input_dim' not in configs:
+        if 'fbank_conf' in configs['dataset_conf']:
+            input_dim = configs['dataset_conf']['fbank_conf']['num_mel_bins']
+        elif 'log_mel_spectrogram_conf' in configs['dataset_conf']:
+            input_dim = configs['dataset_conf']['log_mel_spectrogram_conf'][
+                'num_mel_bins']
         else:
-            input_dim = configs['input_dim']
-
-        configs['input_dim'] = input_dim
+            input_dim = configs['dataset_conf']['mfcc_conf']['num_mel_bins']
+    else:
+        input_dim = configs['input_dim']
 
     configs, _ = get_blank_id(configs, symbol_table)
+
+    configs['input_dim'] = input_dim
     configs['output_dim'] = configs['vocab_size']
 
     configs['train_engine'] = args.train_engine
@@ -369,23 +331,24 @@ def init_dataset_and_dataloader(args, configs, tokenizer, seed=777):
     # if save_interval in configs, steps mode else epoch mode
     if "save_interval" in configs:
         configs['dataset_conf']['cycle'] = configs.get('max_epoch', 100)
-    conf = configs['dataset_conf']
-    dataset_type = configs.get('dataset', 'asr')
+    train_conf = configs['dataset_conf']
+    cv_conf = copy.deepcopy(train_conf)
+    cv_conf['cycle'] = 1
+    cv_conf['speed_perturb'] = False
+    cv_conf['spec_aug'] = False
+    cv_conf['spec_sub'] = False
+    cv_conf['spec_trim'] = False
+    cv_conf['shuffle'] = False
+    cv_conf['list_shuffle'] = False
+
     configs['vocab_size'] = tokenizer.vocab_size()
-    train_dataset = init_dataset(dataset_type,
-                                 args.data_type,
-                                 args.train_data,
-                                 tokenizer,
-                                 conf,
-                                 True,
-                                 split='train')
-    cv_dataset = init_dataset(dataset_type,
-                              args.data_type,
-                              args.cv_data,
-                              tokenizer,
-                              conf,
-                              partition=False,
-                              split='cv')
+    train_dataset = Dataset(args.data_type, args.train_data, tokenizer,
+                            train_conf, True)
+    cv_dataset = Dataset(args.data_type,
+                         args.cv_data,
+                         tokenizer,
+                         cv_conf,
+                         partition=False)
 
     # NOTE(xcsong): Why we prefer persistent_workers=True ?
     #   https://discuss.pytorch.org/t/what-are-the-dis-advantages-of-persistent-workers/102110
@@ -884,43 +847,52 @@ def freeze_modules(model, args):
                 logging.debug("{} module is freezed".format(name))
 
 
-def reinit_lora(model, args, configs, tokenizer, seed=777):
-    from tqdm import tqdm
-    from wenet.finetune.lora.utils import estimate_gradient, reinit_lora_modules
-    from wenet.finetune.lora.layers import LoRALayer
-    from types import SimpleNamespace
+def collate_fn_pad(batch):
 
-    logging.info("reinit lora modules.")
-    with open(args.lora_init_yaml, 'r') as file:
-        lora_config = yaml.safe_load(file)
+    # Regular Mode
+    if len(batch[0]) == 2:
 
-    generator = torch.Generator()
-    generator.manual_seed(seed)
-    dataset_conf = copy.deepcopy(configs['dataset_conf'])
-    dataset_conf['batch_conf']['batch_size'] = lora_config['init_batch_size']
-    dataset_type = configs.get('dataset', 'asr')
-    dataset = init_dataset(dataset_type, args.data_type, args.train_data,
-                           tokenizer, dataset_conf, True)
-    dataloader = DataLoader(dataset,
-                            batch_size=None,
-                            pin_memory=args.pin_memory,
-                            num_workers=args.num_workers,
-                            persistent_workers=True,
-                            generator=generator,
-                            prefetch_factor=args.prefetch)
-    additional_kwargs = {}
-    if lora_config["init_config"]["mode"] == "gradient":
-        named_grads = estimate_gradient(model, dataloader,
-                                        lora_config['init_iters'])
-        additional_kwargs["named_grads"] = named_grads
-    lora_config = SimpleNamespace(**lora_config["init_config"])
-    for name, module in tqdm(
-        model.named_modules(),
-        desc="Reinitializing Lora",
-        total=len(list(model.named_modules())),
-    ):
-        if isinstance(module, LoRALayer):
-            reinit_lora_modules(name, module, lora_config, **additional_kwargs)
-    # lora_init_model needs to be saved, w0 = w0 - A0 * B0
-    save_checkpoint(model, os.path.join(args.model_dir, "lora_init.pt"),
-                    infos={"tag": "lora_init", **configs})
+        # Sorting sequences by lengths
+        sorted_batch = sorted(batch, key=lambda x: x[0].shape[1], reverse=True)
+
+        # Pad data sequences
+        data = [item[0].squeeze() for item in sorted_batch]
+        data_lengths = torch.tensor([len(d) for d in data], dtype=torch.long)
+        data = torch.nn.utils.rnn.pad_sequence(data,
+                                               batch_first=True,
+                                               padding_value=0)
+
+        # Pad labels
+        target = [item[1] for item in sorted_batch]
+        target_lengths = torch.tensor([t.size(0) for t in target],
+                                      dtype=torch.long)
+        target = torch.nn.utils.rnn.pad_sequence(target,
+                                                 batch_first=True,
+                                                 padding_value=0)
+
+        return data, target, data_lengths, target_lengths
+        ''''
+    # Regular Mode
+    if len(batch[0]) == 2:
+        # Sorting sequences by lengths
+        sorted_batch = sorted(batch, key=lambda x: x[0].shape[1], reverse=True)
+
+        # Pad data sequences
+        data = [item[0].squeeze() for item in sorted_batch]
+        data_lengths = torch.tensor([len(d) for d in data], dtype=torch.long)
+        max_len_data = (T - len(max(data, key=len)) % T) + len(max(data, key=len))
+
+        data[0] = nn.ConstantPad1d((0, max_len_data - data[0].shape[0]), 0)(data[0])
+        data = torch.nn.utils.rnn.pad_sequence(data, batch_first=True, padding_value=0)
+
+        # Pad labels
+        target = [item[1] for item in sorted_batch]
+        target_lengths = torch.tensor([t.size(0) for t in target], dtype=torch.long)
+        max_len_target = (T - len(max(target, key=len)) % T) + len(max(target, key=len))
+
+        target[0] = nn.ConstantPad1d((0, max_len_target - target[0].shape[0]), 0)(target[0])
+
+        target = torch.nn.utils.rnn.pad_sequence(target, batch_first=True, padding_value=0)
+
+        return data, target, data_lengths, target_lengths
+        '''

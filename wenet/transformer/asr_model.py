@@ -22,10 +22,13 @@ from wenet.transformer.ctc import CTC
 from wenet.transformer.decoder import TransformerDecoder
 from wenet.transformer.encoder import BaseEncoder
 from wenet.transformer.label_smoothing_loss import LabelSmoothingLoss
-from wenet.transformer.search import (ctc_greedy_search,
-                                      ctc_prefix_beam_search,
-                                      attention_beam_search,
-                                      attention_rescoring, DecodeResult)
+from wenet.transformer.search import (
+    ctc_greedy_search,
+    ctc_prefix_beam_search,
+    attention_beam_search,
+    # spike_attention_beam_search,
+    attention_rescoring,
+    DecodeResult)
 from wenet.utils.mask import make_pad_mask
 from wenet.utils.common import (IGNORE_ID, add_sos_eos, th_accuracy,
                                 reverse_pad_list)
@@ -132,9 +135,6 @@ class ASRModel(torch.nn.Module):
             "loss_ctc": loss_ctc,
             "th_accuracy": acc_att,
         }
-
-    def tie_or_clone_weights(self, jit_mode: bool = True):
-        self.decoder.tie_or_clone_weights(jit_mode)
 
     @torch.jit.unused
     def _forward_ctc(

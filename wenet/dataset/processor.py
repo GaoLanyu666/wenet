@@ -126,13 +126,14 @@ def decode_wav(sample):
     """ Parse key/wav/txt from json line
 
         Args:
-            sample: str, str is a json line has key/wav
+            sample: str, str is a json line has key/wav/txt
 
         Returns:
             {key, wav, sample_rate, ...}
     """
     assert 'key' in sample
     assert 'wav' in sample
+    assert 'txt' in sample
     wav_file = sample['wav']
     if isinstance(wav_file, str):
         with open(wav_file, 'rb') as f:
@@ -143,7 +144,7 @@ def decode_wav(sample):
         start_frame = int(sample['start'] * sample_rate)
         end_frame = int(sample['end'] * sample_rate)
         with io.BytesIO(wav_file) as file_obj:
-            waveform, _ = torchaudio.load(file_obj,
+            waveform, _ = torchaudio.load(filepath=file_obj,
                                           num_frames=end_frame - start_frame,
                                           frame_offset=start_frame)
     else:
@@ -597,3 +598,77 @@ class DynamicBatchWindow:
             self.longest_frames = new_sample_frames
             return True
         return False
+
+
+def padding_spike_length(data):
+    """ Padding the data into training data
+
+        将长度填充到能被SNN的T整除
+
+        Args:
+            data: List[{key, feat, label}
+
+        Returns:
+            Tuple(keys, feats, labels, feats lengths, label lengths)
+    """
+    T = 4  # snn时间步
+    sample = data
+    assert isinstance(sample, list)
+    feats_length = torch.tensor([x['feat'].size(0) for x in sample],
+                                dtype=torch.int32)
+    order = torch.argsort(feats_length, descending=True)
+    feats_lengths = torch.tensor([sample[i]['feat'].size(0) for i in order],
+                                 dtype=torch.int32)
+    sorted_feats = [sample[i]['feat'] for i in order]
+    sorted_keys = [sample[i]['key'] for i in order]
+    sorted_labels = [
+        torch.tensor(sample[i]['label'], dtype=torch.int64) for i in order
+    ]
+    sorted_wavs = [sample[i]['wav'].squeeze(0) for i in order]
+    langs = [sample[i]['lang'] for i in order]
+    tasks = [sample[i]['task'] for i in order]
+    label_lengths = torch.tensor([x.size(0) for x in sorted_labels],
+                                 dtype=torch.int32)
+    wav_lengths = torch.tensor([x.size(0) for x in sorted_wavs],
+                               dtype=torch.int32)
+
+    # length填充到被T整除， 只处理feats和labels
+
+    max_sorted_feats = (T - len(max(sorted_feats, key=len)) % T) + len(
+        max(sorted_feats, key=len))
+    sorted_feats[0] = torch.nn.ConstantPad1d(
+        (0, max_sorted_feats - sorted_feats[0].shape[0]), 0)(sorted_feats[0])
+
+    max_sorted_labels = (T - len(max(sorted_labels, key=len)) % T) + len(
+        max(sorted_labels, key=len))
+    sorted_labels[0] = torch.nn.ConstantPad1d(
+        (0, max_sorted_labels - sorted_labels[0].shape[0]),
+        0)(sorted_labels[0])
+
+    print("padding: ", sorted_feats)
+
+    padded_feats = pad_sequence(sorted_feats,
+                                batch_first=True,
+                                padding_value=0)
+    padding_labels = pad_sequence(sorted_labels,
+                                  batch_first=True,
+                                  padding_value=-1)
+
+    padded_wavs = pad_sequence(sorted_wavs, batch_first=True, padding_value=0)
+
+    batch = {
+        "keys": sorted_keys,
+        "feats": padded_feats,
+        "target": padding_labels,
+        "feats_lengths": feats_lengths,
+        "target_lengths": label_lengths,
+        "pcm": padded_wavs,
+        "pcm_length": wav_lengths,
+        "langs": langs,
+        "tasks": tasks,
+    }
+    if 'speaker' in sample[0]:
+        speaker = torch.tensor([sample[i]['speaker'] for i in order],
+                               dtype=torch.int32)
+        batch['speaker'] = speaker
+    return batch

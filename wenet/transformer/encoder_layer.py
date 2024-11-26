@@ -15,7 +15,6 @@
 # Modified from ESPnet(https://github.com/espnet/espnet)
 """Encoder self-attention layer definition."""
 
-from functools import partial
 from typing import Optional, Tuple
 
 import torch
@@ -50,22 +49,14 @@ class TransformerEncoderLayer(nn.Module):
         normalize_before: bool = True,
         layer_norm_type: str = 'layer_norm',
         norm_eps: float = 1e-5,
-        rms_norm_offset: bool = True,
     ):
         """Construct an EncoderLayer object."""
         super().__init__()
         self.self_attn = self_attn
         self.feed_forward = feed_forward
         assert layer_norm_type in ['layer_norm', 'rms_norm']
-
-        norm_class = WENET_NORM_CLASSES[layer_norm_type]
-        if layer_norm_type == "rms_norm":
-            norm_class = partial(
-                norm_class,
-                add_unit_offset=rms_norm_offset,
-            )
-        self.norm1 = norm_class(size, eps=norm_eps)
-        self.norm2 = norm_class(size, eps=norm_eps)
+        self.norm1 = WENET_NORM_CLASSES[layer_norm_type](size, eps=norm_eps)
+        self.norm2 = WENET_NORM_CLASSES[layer_norm_type](size, eps=norm_eps)
         self.dropout = nn.Dropout(dropout_rate)
         self.size = size
         self.normalize_before = normalize_before
@@ -244,6 +235,426 @@ class ConformerEncoderLayer(nn.Module):
             residual = x
             if self.normalize_before:
                 x = self.norm_conv(x)
+            x, new_cnn_cache = self.conv_module(x, mask_pad, cnn_cache)
+            x = residual + self.dropout(x)
+
+            if not self.normalize_before:
+                x = self.norm_conv(x)
+
+        # feed forward module
+        residual = x
+        if self.normalize_before:
+            x = self.norm_ff(x)
+
+        x = residual + self.ff_scale * self.dropout(self.feed_forward(x))
+        if not self.normalize_before:
+            x = self.norm_ff(x)
+
+        if self.conv_module is not None:
+            x = self.norm_final(x)
+
+        return x, mask, new_att_cache, new_cnn_cache
+
+
+class SpikeformerEncoderLayer(nn.Module):
+    """Encoder layer module.
+
+    Args:
+        size (int): Input dimension.
+        self_attn (torch.nn.Module): Self-attention module instance.
+            `MultiHeadedAttention` or `RelPositionMultiHeadedAttention`
+            instance can be used as the argument.
+        feed_forward (torch.nn.Module): Feed-forward module instance.
+            `PositionwiseFeedForward`, instance can be used as the argument.
+        dropout_rate (float): Dropout rate.
+        normalize_before (bool):
+            True: use layer_norm before each sub-block.
+            False: to use layer_norm after each sub-block.
+    """
+
+    def __init__(
+        self,
+        size: int,
+        self_attn: torch.nn.Module,
+        feed_forward: torch.nn.Module,
+        dropout_rate: float,
+        normalize_before: bool = True,
+        layer_norm_type: str = 'layer_norm',
+        norm_eps: float = 1e-5,
+        node: str = "plif",
+        T: int = 4,
+    ):
+        """Construct an EncoderLayer object."""
+        super().__init__()
+        self.self_attn = self_attn
+        self.feed_forward = feed_forward
+        assert layer_norm_type in ['layer_norm', 'rms_norm']
+        self.norm1 = WENET_NORM_CLASSES[layer_norm_type](size, eps=norm_eps)
+        self.norm2 = WENET_NORM_CLASSES[layer_norm_type](size, eps=norm_eps)
+        self.dropout = nn.Dropout(dropout_rate)
+        self.size = size
+        self.normalize_before = normalize_before
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        mask: torch.Tensor,
+        pos_emb: torch.Tensor,
+        # mask_pad: torch.Tensor = torch.ones((0, 0, 0), dtype=torch.bool),
+        mask_pad: torch.Tensor = torch.ones((0, 0, 0, 0), dtype=torch.bool),
+        # att_cache: T_CACHE = (torch.zeros(
+        # (0, 0, 0, 0)), torch.zeros((0, 0, 0, 0))),
+        att_cache: T_CACHE = (torch.zeros(
+            (0, 0, 0, 0, 0)), torch.zeros((0, 0, 0, 0, 0))),
+        # cnn_cache: torch.Tensor = torch.zeros((0, 0, 0, 0)),
+        cnn_cache: torch.Tensor = torch.zeros((0, 0, 0, 0, 0)),
+    ) -> Tuple[torch.Tensor, torch.Tensor, T_CACHE, torch.Tensor]:
+        """Compute encoded features.
+
+        Args:
+            x (torch.Tensor): (#batch, time, size)
+            mask (torch.Tensor): Mask tensor for the input (#batch, time，time),
+                (0, 0, 0) means fake mask.
+            pos_emb (torch.Tensor): just for interface compatibility
+                to ConformerEncoderLayer
+            mask_pad (torch.Tensor): does not used in transformer layer,
+                just for unified api with conformer.
+            att_cache (torch.Tensor): Cache tensor of the KEY & VALUE
+                (#batch=1, head, cache_t1, d_k * 2), head * d_k == size.
+            cnn_cache (torch.Tensor): Convolution cache in conformer layer
+                (#batch=1, size, cache_t2), not used here, it's for interface
+                compatibility to ConformerEncoderLayer.
+        Returns:
+            torch.Tensor: Output tensor (#batch, time, size).
+            torch.Tensor: Mask tensor (#batch, time, time).
+            torch.Tensor: att_cache tensor,
+                (#batch=1, head, cache_t1 + time, d_k * 2).
+            torch.Tensor: cnn_cahce tensor (#batch=1, size, cache_t2).
+
+        """
+        residual = x
+        if self.normalize_before:
+            x = self.norm1(x)
+        x_att, new_att_cache = self.self_attn(x,
+                                              x,
+                                              x,
+                                              mask,
+                                              pos_emb,
+                                              cache=att_cache)
+        x = residual + self.dropout(x_att)
+        if not self.normalize_before:
+            x = self.norm1(x)
+
+        residual = x
+        if self.normalize_before:
+            x = self.norm2(x)
+        x = residual + self.dropout(self.feed_forward(x))
+        if not self.normalize_before:
+            x = self.norm2(x)
+
+        # fake_cnn_cache = torch.zeros((0, 0, 0), dtype=x.dtype, device=x.device)
+        fake_cnn_cache = torch.zeros((0, 0, 0, 0),
+                                     dtype=x.dtype,
+                                     device=x.device)
+        return x, mask, new_att_cache, fake_cnn_cache
+
+
+class SpikeConformerEncoderLayer(nn.Module):
+    """Encoder layer module.
+    Args:
+        size (int): Input dimension.
+        self_attn (torch.nn.Module): Self-attention module instance.
+            `MultiHeadedAttention` or `RelPositionMultiHeadedAttention`
+            instance can be used as the argument.
+        feed_forward (torch.nn.Module): Feed-forward module instance.
+            `PositionwiseFeedForward` instance can be used as the argument.
+        feed_forward_macaron (torch.nn.Module): Additional feed-forward module
+             instance.
+            `PositionwiseFeedForward` instance can be used as the argument.
+        conv_module (torch.nn.Module): Convolution module instance.
+            `ConvlutionModule` instance can be used as the argument.
+        dropout_rate (float): Dropout rate.
+        normalize_before (bool):
+            True: use layer_norm before each sub-block.
+            False: use layer_norm after each sub-block.
+    """
+
+    def __init__(
+        self,
+        size: int,
+        self_attn: torch.nn.Module,
+        feed_forward: Optional[nn.Module] = None,
+        feed_forward_macaron: Optional[nn.Module] = None,
+        conv_module: Optional[nn.Module] = None,
+        dropout_rate: float = 0.1,
+        normalize_before: bool = True,
+        layer_norm_type: str = 'layer_norm',
+        norm_eps: float = 1e-5,
+        node: str = "plif",
+        T: int = 4,
+    ):
+        """Construct an EncoderLayer object."""
+        super().__init__()
+        self.self_attn = self_attn
+        self.feed_forward = feed_forward
+        assert layer_norm_type in ['layer_norm', 'rms_norm']
+        self.feed_forward_macaron = feed_forward_macaron
+        self.conv_module = conv_module
+        self.norm_ff = WENET_NORM_CLASSES[layer_norm_type](
+            size, eps=norm_eps)  # for the FNN module
+        self.norm_mha = WENET_NORM_CLASSES[layer_norm_type](
+            size, eps=norm_eps)  # for the MHA module
+        if feed_forward_macaron is not None:
+            self.norm_ff_macaron = WENET_NORM_CLASSES[layer_norm_type](
+                size, eps=norm_eps)
+            self.ff_scale = 0.5
+        else:
+            self.ff_scale = 1.0
+        if self.conv_module is not None:
+            self.norm_conv = WENET_NORM_CLASSES[layer_norm_type](
+                size, eps=norm_eps)  # for the CNN module
+            self.norm_final = WENET_NORM_CLASSES[layer_norm_type](
+                size, eps=norm_eps)  # for the final output of the block
+        self.dropout = nn.Dropout(dropout_rate)
+        self.size = size
+        self.normalize_before = normalize_before
+        self.node = node
+        self.T = T
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        mask: torch.Tensor,
+        pos_emb: torch.Tensor,
+        mask_pad: torch.Tensor = torch.ones((0, 0, 0), dtype=torch.bool),
+        att_cache: T_CACHE = (torch.zeros(
+            (0, 0, 0, 0)), torch.zeros((0, 0, 0, 0))),
+        cnn_cache: torch.Tensor = torch.zeros((0, 0, 0, 0)),
+    ) -> Tuple[torch.Tensor, torch.Tensor, T_CACHE, torch.Tensor]:
+        """Compute encoded features.
+
+        Args:
+            x (torch.Tensor): (#batch, time, size)
+            mask (torch.Tensor): Mask tensor for the input (#batch, time，time),
+                (0, 0, 0) means fake mask.
+            pos_emb (torch.Tensor): positional encoding, must not be None
+                for ConformerEncoderLayer.
+            mask_pad (torch.Tensor): batch padding mask used for conv module.
+                (#batch, 1，time), (0, 0, 0) means fake mask.
+            att_cache (torch.Tensor): Cache tensor of the KEY & VALUE
+                (#batch=1, head, cache_t1, d_k * 2), head * d_k == size.
+            cnn_cache (torch.Tensor): Convolution cache in conformer layer
+                (#batch=1, size, cache_t2)
+        Returns:
+            torch.Tensor: Output tensor (#batch, time, size).
+            torch.Tensor: Mask tensor (#batch, time, time).
+            torch.Tensor: att_cache tensor,
+                (#batch=1, head, cache_t1 + time, d_k * 2).
+            torch.Tensor: cnn_cahce tensor (#batch, size, cache_t2).
+        """
+        # (T * batch, time, size)
+        # print("residual:", x.shape)
+        # print("Self.T:", self.T)
+        # whether to use macaron style
+        if self.feed_forward_macaron is not None:
+            # print("residual", x.shape)
+            residual = x
+            if self.normalize_before:
+                x = self.norm_ff_macaron(x)
+            x = residual + self.ff_scale * self.dropout(
+                self.feed_forward_macaron(x))
+            if not self.normalize_before:
+                x = self.norm_ff_macaron(x)
+
+        # multi-headed self-attention module
+        residual = x
+        if self.normalize_before:
+            x = self.norm_mha(x)
+        x_att, new_att_cache = self.self_attn(x, x, x, mask, pos_emb,
+                                              att_cache)
+        x = residual + self.dropout(x_att)
+        if not self.normalize_before:
+            x = self.norm_mha(x)
+
+        # convolution module
+        # Fake new cnn cache here, and then change it in conv_module
+        new_cnn_cache = torch.zeros((0, 0, 0), dtype=x.dtype, device=x.device)
+        if self.conv_module is not None:
+            residual = x
+            if self.normalize_before:
+                x = self.norm_conv(x)
+            # x = x.reshape(self.T, int(x.size(0)/self.T), x.size(1), x.size(2)).contiguous()  # (T, batch, time, size)
+            x, new_cnn_cache = self.conv_module(x, mask_pad, cnn_cache)
+            x = residual + self.dropout(x)
+
+            if not self.normalize_before:
+                x = self.norm_conv(x)
+
+        # feed forward module
+        residual = x
+        if self.normalize_before:
+            x = self.norm_ff(x)
+
+        x = residual + self.ff_scale * self.dropout(self.feed_forward(x))
+        if not self.normalize_before:
+            x = self.norm_ff(x)
+
+        if self.conv_module is not None:
+            x = self.norm_final(x)
+
+        return x, mask, new_att_cache, new_cnn_cache
+
+
+class SpikeTConformerEncoderLayer(nn.Module):
+    """Encoder layer module.
+    Args:
+        size (int): Input dimension.
+        self_attn (torch.nn.Module): Self-attention module instance.
+            `MultiHeadedAttention` or `RelPositionMultiHeadedAttention`
+            instance can be used as the argument.
+        feed_forward (torch.nn.Module): Feed-forward module instance.
+            `PositionwiseFeedForward` instance can be used as the argument.
+        feed_forward_macaron (torch.nn.Module): Additional feed-forward module
+             instance.
+            `PositionwiseFeedForward` instance can be used as the argument.
+        conv_module (torch.nn.Module): Convolution module instance.
+            `ConvlutionModule` instance can be used as the argument.
+        dropout_rate (float): Dropout rate.
+        normalize_before (bool):
+            True: use layer_norm before each sub-block.
+            False: use layer_norm after each sub-block.
+    """
+
+    def __init__(
+        self,
+        size: int,
+        self_attn: torch.nn.Module,
+        feed_forward: Optional[nn.Module] = None,
+        feed_forward_macaron: Optional[nn.Module] = None,
+        conv_module: Optional[nn.Module] = None,
+        dropout_rate: float = 0.1,
+        normalize_before: bool = True,
+        layer_norm_type: str = 'layer_norm',
+        norm_eps: float = 1e-5,
+        node: str = "plif",
+        T: int = 4,
+    ):
+        """Construct an EncoderLayer object."""
+        super().__init__()
+        self.self_attn = self_attn
+        self.feed_forward = feed_forward
+        assert layer_norm_type in ['layer_norm', 'rms_norm']
+        self.feed_forward_macaron = feed_forward_macaron
+        self.conv_module = conv_module
+        self.norm_ff = WENET_NORM_CLASSES[layer_norm_type](
+            size, eps=norm_eps)  # for the FNN module
+        self.norm_mha = WENET_NORM_CLASSES[layer_norm_type](
+            size, eps=norm_eps)  # for the MHA module
+        if feed_forward_macaron is not None:
+            self.norm_ff_macaron = WENET_NORM_CLASSES[layer_norm_type](
+                size, eps=norm_eps)
+            self.ff_scale = 0.5
+        else:
+            self.ff_scale = 1.0
+        if self.conv_module is not None:
+            self.norm_conv = WENET_NORM_CLASSES[layer_norm_type](
+                size, eps=norm_eps)  # for the CNN module
+            self.norm_final = WENET_NORM_CLASSES[layer_norm_type](
+                size, eps=norm_eps)  # for the final output of the block
+        self.dropout = nn.Dropout(dropout_rate)
+        self.size = size
+        self.normalize_before = normalize_before
+        self.node = node
+        self.T = T
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        mask: torch.Tensor,
+        pos_emb: torch.Tensor,
+        mask_pad: torch.Tensor = torch.ones((0, 0, 0), dtype=torch.bool),
+        att_cache: T_CACHE = (torch.zeros(
+            (0, 0, 0, 0)), torch.zeros((0, 0, 0, 0))),
+        cnn_cache: torch.Tensor = torch.zeros((0, 0, 0, 0)),
+    ) -> Tuple[torch.Tensor, torch.Tensor, T_CACHE, torch.Tensor]:
+        """Compute encoded features.
+
+        Args:
+            x (torch.Tensor): (#batch, time, size)
+            mask (torch.Tensor): Mask tensor for the input (#batch, time，time),
+                (0, 0, 0) means fake mask.
+            pos_emb (torch.Tensor): positional encoding, must not be None
+                for ConformerEncoderLayer.
+            mask_pad (torch.Tensor): batch padding mask used for conv module.
+                (#batch, 1，time), (0, 0, 0) means fake mask.
+            att_cache (torch.Tensor): Cache tensor of the KEY & VALUE
+                (#batch=1, head, cache_t1, d_k * 2), head * d_k == size.
+            cnn_cache (torch.Tensor): Convolution cache in conformer layer
+                (#batch=1, size, cache_t2)
+        Returns:
+            torch.Tensor: Output tensor (#batch, time, size).
+            torch.Tensor: Mask tensor (#batch, time, time).
+            torch.Tensor: att_cache tensor,
+                (#batch=1, head, cache_t1 + time, d_k * 2).
+            torch.Tensor: cnn_cahce tensor (#batch, size, cache_t2).
+        """
+        # (T * batch, time, size)
+        # whether to use macaron style
+        if self.feed_forward_macaron is not None:
+            # print("residual", x.shape)
+            residual = x
+            if self.normalize_before:
+                x = self.norm_ff_macaron(x)
+            x = residual + self.ff_scale * self.dropout(
+                self.feed_forward_macaron(x))
+            if not self.normalize_before:
+                x = self.norm_ff_macaron(x)
+
+        # multi-headed self-attention module
+        residual = x
+        if self.normalize_before:
+            x = self.norm_mha(x)
+
+        # T combine t
+        x = x.reshape(self.T,
+                      x.size(0) // self.T, x.size(1),
+                      x.size(2)).contiguous()  # (T, b, t, d)
+        x = x.transpose(0, 1).flatten(1, 2).contiguous()  # (b, Tt, d)
+
+        # print("before mask.shape:", mask.shape)
+
+        mask = mask.reshape(self.T,
+                            mask.size(0) // self.T, mask.size(1),
+                            mask.size(2)).contiguous()  # (T, b, d, t)
+        mask = mask.transpose(0, 1).transpose(1, 2).flatten(
+            2, 3).contiguous()  # (b, d, Tt)
+
+        # print("mask.shape:", mask.shape)
+
+        x_att, new_att_cache = self.self_attn(x, x, x, mask, pos_emb,
+                                              att_cache)
+
+        x_att = x_att.reshape(x_att.size(0), self.T,
+                              x_att.size(1) // self.T,
+                              x_att.size(2)).contiguous()  # (b, Tt, d)
+        x_att = x_att.transpose(0, 1).flatten(0, 1)  # (Tb, t, d)
+
+        mask = mask.reshape(mask.size(0), mask.size(1), self.T,
+                            mask.size(2) // self.T).contiguous()  # (b, d, Tt)
+        mask = mask.transpose(1, 2).transpose(0, 1).flatten(0, 1)  # (Tb, t, d)
+
+        x = residual + self.dropout(x_att)
+        if not self.normalize_before:
+            x = self.norm_mha(x)
+
+        # convolution module
+        # Fake new cnn cache here, and then change it in conv_module
+        new_cnn_cache = torch.zeros((0, 0, 0), dtype=x.dtype, device=x.device)
+        if self.conv_module is not None:
+            residual = x
+            if self.normalize_before:
+                x = self.norm_conv(x)
+            # x = x.reshape(self.T, int(x.size(0)/self.T), x.size(1), x.size(2)).contiguous()  # (T, batch, time, size)
             x, new_cnn_cache = self.conv_module(x, mask_pad, cnn_cache)
             x = residual + self.dropout(x)
 

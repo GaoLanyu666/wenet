@@ -16,6 +16,274 @@
 
 import torch
 
+from spikingjelly.clock_driven.neuron import MultiStepParametricLIFNode, MultiStepLIFNode
+
+
+class MS_MLP(torch.nn.Module):
+    """Positionwise feed forward layer.
+
+    FeedForward are appied on each position of the sequence.
+    The output dim is same with the input dim.
+
+    Args:
+        idim (int): Input dimenstion.
+        hidden_units (int): The number of hidden units.
+        dropout_rate (float): Dropout rate.
+        activation (torch.nn.Module): Activation function
+    """
+
+    def __init__(
+        self,
+        idim: int,
+        hidden_units: int,
+        dropout_rate: float,
+        activation: torch.nn.Module = torch.nn.ReLU(),
+        bias: bool = True,
+        node: str = "plif",
+        T: int = 4,
+        *dummy_args,
+        **dummy_kwargs,
+    ):
+        """Construct a PositionwiseFeedForward object."""
+        super(MS_MLP, self).__init__()
+
+        self.T = T
+        if node == "plif":
+            self.fc1_lif = MultiStepParametricLIFNode(detach_reset=True)
+        elif node == "lif":
+            self.fc1_lif = MultiStepLIFNode(tau=2.0, detach_reset=True)
+        else:
+            self.fc1_lif = MultiStepLIFNode(tau=2.0, detach_reset=True)
+        self.fc1_linear = torch.nn.Linear(idim, hidden_units, bias=bias)
+        self.fc1_bn = torch.nn.BatchNorm1d(hidden_units)
+
+        if node == "plif":
+            self.fc2_lif = MultiStepParametricLIFNode(detach_reset=True)
+        elif node == "lif":
+            self.fc2_lif = MultiStepLIFNode(tau=2.0, detach_reset=True)
+        else:
+            self.fc2_lif = MultiStepLIFNode(tau=2.0, detach_reset=True)
+        self.fc2_linear = torch.nn.Linear(hidden_units, idim, bias=bias)
+        self.fc2_bn = torch.nn.BatchNorm1d(idim)
+
+        self.dropout = torch.nn.Dropout(dropout_rate)
+
+    def forward(self, xs: torch.Tensor) -> torch.Tensor:
+        """Forward function.
+
+        Args:
+            xs: input tensor (B, L, D)
+        Returns:
+            output tensor, (B, L, D)
+        """
+
+        # (T, b/T, t, d)
+
+        # x = self.fc1_lif(x)  # (T, b/T, t, d)
+        x = self.fc1_linear(xs.flatten(0, 1))  # (Tb, t, d)
+        x = self.fc1_bn(x.transpose(1,
+                                    2).contiguous()).transpose(1,
+                                                               2).contiguous()
+        x = self.fc1_lif(
+            x.reshape(self.T, int(x.size(0) / self.T), x.size(1),
+                      x.size(2)).contiguous())
+
+        x = self.dropout(x)
+
+        # x = self.fc2_lif(x.reshape(self.T, int(x.size(0)/self.T), x.size(1), x.size(2)).contiguous())
+        x = self.fc2_linear(x.flatten(0, 1))
+        x = self.fc2_bn(x.transpose(1,
+                                    2).contiguous()).transpose(1,
+                                                               2).contiguous()
+        x = self.fc2_lif(
+            x.reshape(self.T, int(x.size(0) / self.T), x.size(1),
+                      x.size(2)).contiguous())
+
+        return x
+
+
+class SpikePositionwiseFeedForward(torch.nn.Module):
+    """Positionwise feed forward layer.
+
+    FeedForward are appied on each position of the sequence.
+    The output dim is same with the input dim.
+
+    Args:
+        idim (int): Input dimenstion.
+        hidden_units (int): The number of hidden units.
+        dropout_rate (float): Dropout rate.
+        activation (torch.nn.Module): Activation function
+    """
+
+    def __init__(
+        self,
+        idim: int,
+        hidden_units: int,
+        dropout_rate: float,
+        activation: torch.nn.Module = torch.nn.ReLU(),
+        bias: bool = True,
+        node: str = "plif",
+        T: int = 4,
+        *dummy_args,
+        **dummy_kwargs,
+    ):
+        """Construct a PositionwiseFeedForward object."""
+        super(SpikePositionwiseFeedForward, self).__init__()
+        self.w_1 = torch.nn.Linear(idim, hidden_units, bias=bias)
+        self.T = T
+        if node == "plif":
+            self.activation = MultiStepParametricLIFNode(detach_reset=True)
+        elif node == "lif":
+            self.activation = MultiStepLIFNode(tau=2.0, detach_reset=True)
+        else:
+            self.activation = MultiStepLIFNode(tau=2.0, detach_reset=True)
+        self.dropout = torch.nn.Dropout(dropout_rate)
+        self.w_2 = torch.nn.Linear(hidden_units, idim, bias=bias)
+        # print("init,self.T:", self.T)
+
+    def forward(self, xs: torch.Tensor) -> torch.Tensor:
+        """Forward function.
+
+        Args:
+            xs: input tensor (T * B, L, D)
+        Returns:
+            output tensor, (T * B, L, D)
+        """
+        # print("xs:", xs.shape)
+        # print("self.T:", self.T)
+        xs = self.w_1(xs)  # (Tb, L, D)
+        xs = xs.reshape(self.T,
+                        xs.size(0) // self.T, xs.size(1),
+                        xs.size(2)).contiguous()
+        xs = self.activation(xs)
+        xs = xs.flatten(0, 1)
+        xs = self.dropout(xs)
+        xs = self.w_2(xs)
+        # print("xs:", xs.shape)
+        return xs
+        # return self.w_2(self.dropout(self.activation(self.w_1(xs))))
+
+
+class SpikeLengthPositionwiseFeedForward(torch.nn.Module):
+    """Positionwise feed forward layer.
+
+    FeedForward are appied on each position of the sequence.
+    The output dim is same with the input dim.
+
+    Args:
+        idim (int): Input dimenstion.
+        hidden_units (int): The number of hidden units.
+        dropout_rate (float): Dropout rate.
+        activation (torch.nn.Module): Activation function
+    """
+
+    def __init__(
+        self,
+        idim: int,
+        hidden_units: int,
+        dropout_rate: float,
+        activation: torch.nn.Module = torch.nn.ReLU(),
+        bias: bool = True,
+        node: str = "plif",
+        T: int = 4,
+        *dummy_args,
+        **dummy_kwargs,
+    ):
+        """Construct a PositionwiseFeedForward object."""
+        super(SpikeLengthPositionwiseFeedForward, self).__init__()
+        # print("initT:",T)
+        self.w_1 = torch.nn.Linear(idim, hidden_units, bias=bias)
+        self.T = T
+        if node == "plif":
+            self.activation = MultiStepParametricLIFNode(detach_reset=True)
+        elif node == "lif":
+            self.activation = MultiStepLIFNode(tau=2.0, detach_reset=True)
+        else:
+            self.activation = MultiStepLIFNode(tau=2.0, detach_reset=True)
+        self.dropout = torch.nn.Dropout(dropout_rate)
+        self.w_2 = torch.nn.Linear(hidden_units, idim, bias=bias)
+
+    def forward(self, xs: torch.Tensor) -> torch.Tensor:
+        """Forward function.
+
+        Args:
+            xs: input tensor (B, L, D)
+        Returns:
+            output tensor, (B, L, D)
+        """
+        # print("mlpT:",self.T)
+        xs = self.w_1(xs)  # (B, L, D)
+        xs = xs.reshape(xs.size(0), self.T,
+                        xs.size(1) // self.T,
+                        xs.size(2)).contiguous().transpose(
+                            0, 1)  # (T, B, L//T, D)
+        xs = self.activation(xs)
+        xs = xs.transpose(0, 1).flatten(1, 2)  # (B, L, D)
+        xs = self.dropout(xs)
+        xs = self.w_2(xs)
+        # print("xs:", xs.shape)
+        return xs
+        # return self.w_2(self.dropout(self.activation(self.w_1(xs))))
+
+
+class SpikeAudioLengthPositionwiseFeedForward(torch.nn.Module):
+    """Positionwise feed forward layer.
+
+    FeedForward are appied on each position of the sequence.
+    The output dim is same with the input dim.
+
+    Args:
+        idim (int): Input dimenstion.
+        hidden_units (int): The number of hidden units.
+        dropout_rate (float): Dropout rate.
+        activation (torch.nn.Module): Activation function
+    """
+
+    def __init__(
+        self,
+        idim: int,
+        hidden_units: int,
+        dropout_rate: float,
+        activation: torch.nn.Module = torch.nn.ReLU(),
+        bias: bool = True,
+        node: str = "plif",
+        T: int = 4,
+        *dummy_args,
+        **dummy_kwargs,
+    ):
+        """Construct a PositionwiseFeedForward object."""
+        super(SpikeAudioLengthPositionwiseFeedForward, self).__init__()
+        # print("initT:",T)
+        self.w_1 = torch.nn.Linear(idim, hidden_units, bias=bias)
+        self.T = T
+        if node == "plif":
+            self.activation = MultiStepParametricLIFNode(detach_reset=True)
+        elif node == "lif":
+            self.activation = MultiStepLIFNode(tau=2.0, detach_reset=True)
+        else:
+            self.activation = MultiStepLIFNode(tau=2.0, detach_reset=True)
+        self.dropout = torch.nn.Dropout(dropout_rate)
+        self.w_2 = torch.nn.Linear(hidden_units, idim, bias=bias)
+
+    def forward(self, xs: torch.Tensor) -> torch.Tensor:
+        """Forward function.
+
+        Args:
+            xs: input tensor (B, L, D)
+        Returns:
+            output tensor, (B, L, D)
+        """
+        # print("mlpT:",self.T)
+        xs = self.w_1(xs)  # (B, L, D)
+        xs = xs.transpose(0, 1)  # (L, B, D)
+        xs = self.activation(xs)
+        xs = xs.transpose(0, 1)  # (B, L, D)
+        xs = self.dropout(xs)
+        xs = self.w_2(xs)
+        # print("xs:", xs.shape)
+        return xs
+        # return self.w_2(self.dropout(self.activation(self.w_1(xs))))
+
 
 class PositionwiseFeedForward(torch.nn.Module):
     """Positionwise feed forward layer.

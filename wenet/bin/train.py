@@ -36,7 +36,7 @@ from wenet.utils.train_utils import (
     init_dataset_and_dataloader, check_modify_and_save_config,
     init_optimizer_and_scheduler, init_scaler, trace_and_print_model,
     wrap_cuda_model, init_summarywriter, save_model, log_per_epoch,
-    add_lora_args, reinit_lora)
+    add_lora_args)
 
 
 def get_args():
@@ -98,9 +98,6 @@ def main():
 
     # Init asr model from configs
     model, configs = init_model(args, configs)
-
-    if hasattr(args, 'lora_reinit') and args.lora_reinit:
-        reinit_lora(model, args, configs, tokenizer)
 
     # Check model is jitable & print model archtectures
     trace_and_print_model(args, model)
@@ -181,8 +178,6 @@ def main():
             final_model_path) else None
         os.symlink('{}.pt'.format(final_epoch), final_model_path)
         writer.close()
-    dist.barrier(
-    )  # NOTE(yktian): Ensure all ranks end Train before destroy process group.
     dist.destroy_process_group()
 
 

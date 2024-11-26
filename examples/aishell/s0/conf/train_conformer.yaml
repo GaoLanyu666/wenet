@@ -88,6 +88,7 @@ dataset_conf:
     batch_conf:
         batch_type: 'static' # static or dynamic
         batch_size: 16
+    spikepad: false
 
 grad_clip: 5
 accum_grad: 4
